@@ -6,11 +6,17 @@ import androidx.lifecycle.viewModelScope
 import com.google.mlkit.genai.common.FeatureStatus
 import com.google.mlkit.genai.common.audio.AudioSource
 import com.google.mlkit.genai.speechrecognition.SpeechRecognition
+import com.google.mlkit.genai.speechrecognition.SpeechRecognizer
 import com.google.mlkit.genai.speechrecognition.SpeechRecognizerOptions.Mode.Companion.MODE_ADVANCED
+import com.google.mlkit.genai.speechrecognition.SpeechRecognizerOptions.Mode.Companion.MODE_BASIC
 import com.google.mlkit.genai.speechrecognition.speechRecognizerOptions
 import com.google.mlkit.genai.speechrecognition.speechRecognizerRequest
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.runningReduce
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import net.jj1uzh.playspeechrecognition.ui.TopScreenState.Companion.ModelStatus.Downloading
@@ -20,7 +26,8 @@ import java.util.Locale
 data class TopScreenState(
     val recognizedFinal: String = "",
     val recognizedPartial: String = "",
-    val status: RecognizerStatus = Unknown
+    val status: RecognizerStatus = Unknown,
+    val options: RecognizerOptions = RecognizerOptions(JaJP, Advanced),
 ) {
     companion object {
         sealed interface ModelStatus {
@@ -34,6 +41,38 @@ data class TopScreenState(
             data class ModelPreparing(val status: ModelStatus) : RecognizerStatus
             data object Ready : RecognizerStatus
             data object Recognizing : RecognizerStatus
+        }
+
+        data class RecognizerOptions(
+            val locale: RecognizerLocale,
+            val mode: RecognizerMode
+        ) {
+            companion object {
+                enum class RecognizerLocale {
+                    JaJP, EnUS;
+
+                    fun toLocale() = when (this) {
+                        JaJP -> Locale.JAPAN
+                        EnUS -> Locale.ENGLISH
+                    }
+
+                    fun displayName() = toLocale().displayName
+                }
+
+                enum class RecognizerMode {
+                    Basic, Advanced;
+
+                    fun toMode() = when (this) {
+                        Basic -> MODE_BASIC
+                        Advanced -> MODE_ADVANCED
+                    }
+
+                    fun displayName() = when (this) {
+                        Basic -> "Basic"
+                        Advanced -> "Advanced"
+                    }
+                }
+            }
         }
     }
 }
@@ -49,73 +88,96 @@ class TopScreenViewModel : ViewModel() {
     private var _error: MutableStateFlow<String?> = MutableStateFlow(null)
     val error = _error.asStateFlow()
 
-    val speechRecognizer = SpeechRecognition.getClient(
-        speechRecognizerOptions {
-            locale = Locale.JAPAN
-            preferredMode = MODE_ADVANCED
-        }
-    )
+    private var _speechRecognizer = MutableStateFlow<SpeechRecognizer?>(null)
 
-    init {
-        viewModelScope.launch {
-            when (speechRecognizer.checkStatus()) {
-                FeatureStatus.DOWNLOADABLE -> {
-                    speechRecognizer.download().collect {
-                        when (it) {
-                            DownloadCompleted -> {
-                                _uiState.update { it.copy(status = Ready) }
-                            }
+    private fun mkSpeechRecognizerClient(options: TopScreenState.Companion.RecognizerOptions) =
+        SpeechRecognition.getClient(
+            speechRecognizerOptions {
+                locale = options.locale.toLocale()
+                preferredMode = options.mode.toMode()
+            }
+        )
 
-                            is DownloadProgress -> {
-                                val downloaded = it.totalBytesDownloaded
-                                _uiState.update {
-                                    it.copy(
-                                        status = ModelPreparing(
-                                            Downloading(
-                                                downloaded
-                                            )
+    private suspend fun checkSpeechRecognizerClient(speechRecognizer: SpeechRecognizer) {
+        when (speechRecognizer.checkStatus()) {
+            FeatureStatus.DOWNLOADABLE -> {
+                speechRecognizer.download().collect {
+                    when (it) {
+                        DownloadCompleted -> {
+                            _uiState.update { it.copy(status = Ready) }
+                        }
+
+                        is DownloadProgress -> {
+                            val downloaded = it.totalBytesDownloaded
+                            _uiState.update {
+                                it.copy(
+                                    status = ModelPreparing(
+                                        Downloading(
+                                            downloaded
                                         )
                                     )
-                                }
+                                )
                             }
+                        }
 
-                            is DownloadFailed -> {
-                                val msg = it.e.message
-                                _error.update { msg }
-                                Log.e("TopScreenViewModel.init", "DownloadFailed", it.e)
-                                _uiState.update { it.copy(status = ModelPreparing(DownloadFailed)) }
-                            }
+                        is DownloadFailed -> {
+                            val msg = it.e.message
+                            _error.update { msg }
+                            Log.e("TopScreenViewModel.init", "DownloadFailed", it.e)
+                            _uiState.update { it.copy(status = ModelPreparing(DownloadFailed)) }
+                        }
 
-                            is DownloadStarted -> {
-                                val totalBytes = it.bytesToDownload
-                                _modelTotalBytes.update { totalBytes }
-                                _uiState.update { it.copy(status = ModelPreparing(Downloading(0L))) }
-                            }
+                        is DownloadStarted -> {
+                            val totalBytes = it.bytesToDownload
+                            _modelTotalBytes.update { totalBytes }
+                            _uiState.update { it.copy(status = ModelPreparing(Downloading(0L))) }
                         }
                     }
                 }
-
-                FeatureStatus.AVAILABLE -> {
-                    _uiState.update { it.copy(status = Ready) }
-                }
-
-                FeatureStatus.DOWNLOADING -> {}
-                FeatureStatus.UNAVAILABLE -> {
-                    _uiState.update { it.copy(status = ModelPreparing(Unavailable)) }
-                }
             }
+
+            FeatureStatus.AVAILABLE -> {
+                _uiState.update { it.copy(status = Ready) }
+            }
+
+            FeatureStatus.DOWNLOADING -> {}
+            FeatureStatus.UNAVAILABLE -> {
+                _uiState.update { it.copy(status = ModelPreparing(Unavailable)) }
+            }
+        }
+    }
+
+    init {
+        viewModelScope.launch {
+            _uiState
+                .distinctUntilChanged { old, new -> old.options == new.options }
+                .collectLatest {
+                    val options = it.options
+                    val client = mkSpeechRecognizerClient(options)
+                    _speechRecognizer.update { client }
+                    checkSpeechRecognizerClient(client)
+                }
+        }
+        viewModelScope.launch {
+            _speechRecognizer
+                .runningReduce { old, new ->
+                    old?.stopRecognition()
+                    old?.close()
+                    new
+                }
+                .collect()
         }
     }
 
     suspend fun startRecognition() {
         _uiState.update { it.copy(status = Recognizing) }
-        speechRecognizer
-            .startRecognition(
+        _speechRecognizer.value
+            ?.startRecognition(
                 speechRecognizerRequest {
                     audioSource = AudioSource.fromMic()
                 }
             )
-            .collect {
+            ?.collect {
                 when (it) {
                     is ErrorResponse -> {
                         val msg = it.e.message
@@ -147,18 +209,22 @@ class TopScreenViewModel : ViewModel() {
     }
 
     suspend fun stopRecognition() {
-        speechRecognizer.stopRecognition()
+        _speechRecognizer.value?.stopRecognition()
     }
 
     fun clear() {
         _uiState.update { it.copy(recognizedFinal = "", recognizedPartial = "") }
     }
 
+    fun updateOptions(options: TopScreenState.Companion.RecognizerOptions) {
+        _uiState.update { it.copy(options = options) }
+    }
+
     override fun onCleared() {
         try {
             viewModelScope.launch {
-                speechRecognizer.stopRecognition()
-                speechRecognizer.close()
+                _speechRecognizer.value?.stopRecognition()
+                _speechRecognizer.value?.close()
             }
         } catch (err: Exception) {
             Log.e("TopScreenViewModel.onCleared", "failed to clean speechRecognizer", err)
